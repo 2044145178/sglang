@@ -621,6 +621,193 @@ def _get_chunked_embedding_by_item(
     return torch.cat(chunk_slices, dim=0)
 
 
+def _get_spatial_merge_unit(data_embedding_func: DataEmbeddingFunc) -> Optional[int]:
+    owner = getattr(data_embedding_func, "__self__", None)
+    visual = getattr(owner, "visual", None)
+    if visual is None:
+        return None
+
+    spatial_merge_unit = getattr(visual, "spatial_merge_unit", None)
+    if spatial_merge_unit is not None:
+        return int(spatial_merge_unit)
+
+    spatial_merge_size = getattr(visual, "spatial_merge_size", None)
+    if spatial_merge_size is None:
+        return None
+    spatial_merge_size = int(spatial_merge_size)
+    return spatial_merge_size * spatial_merge_size
+
+
+def _get_qwen_like_image_embedding_len(
+    data_embedding_func: DataEmbeddingFunc, item: MultimodalDataItem
+) -> Optional[int]:
+    if getattr(data_embedding_func, "__name__", None) != "get_image_feature":
+        return None
+    if not item.is_image() or item.precomputed_embeddings is not None:
+        return None
+
+    spatial_merge_unit = _get_spatial_merge_unit(data_embedding_func)
+    if spatial_merge_unit is None:
+        return None
+
+    image_grid_thw = item.model_specific_data.get("image_grid_thw")
+    if image_grid_thw is None:
+        return None
+
+    if isinstance(image_grid_thw, torch.Tensor):
+        if image_grid_thw.numel() != 3:
+            return None
+        grid = image_grid_thw.reshape(-1, 3)
+        num_patches = int(torch.prod(grid[0]).item())
+    else:
+        if np.asarray(image_grid_thw).size != 3:
+            return None
+        grid = np.asarray(image_grid_thw).reshape(-1, 3)
+        num_patches = int(np.prod(grid[0]))
+
+    if num_patches % spatial_merge_unit != 0:
+        return None
+    return num_patches // spatial_merge_unit
+
+
+def _assemble_cross_request_chunk_embedding(
+    chunk_entries: List[Tuple[MultimodalDataItem, torch.Tensor, int, int]],
+    chunk_start: int,
+    chunk_end: int,
+) -> Optional[torch.Tensor]:
+    chunk_slices = []
+    for _, emb, start, end in chunk_entries:
+        overlap_start = max(start, chunk_start)
+        overlap_end = min(end, chunk_end - 1)
+        local_start = overlap_start - start
+        local_end = overlap_end - start + 1
+        if local_start < 0 or local_end > emb.shape[0]:
+            return None
+        chunk_slices.append(emb[local_start:local_end])
+
+    if not chunk_slices:
+        return None
+    return torch.cat(chunk_slices, dim=0)
+
+
+def _get_chunked_prefill_embedding_cross_request_vit(
+    data_embedding_func: DataEmbeddingFunc,
+    embedding_items: List[MultimodalDataItem],
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+    input_ids: torch.Tensor,
+    max_iterations: int,
+) -> Optional[tuple[torch.Tensor | None, torch.Tensor]]:
+    """
+    Cross-request image ViT batching for qwen-like image items.
+
+    This path only handles qwen-like image items whose true output lengths can
+    be derived from image_grid_thw and the vision tower spatial merge unit. It
+    keeps all other multimodal cases on the legacy per-request path.
+    """
+    if not envs.SGLANG_MM_CROSS_REQUEST_VIT_BATCH.get():
+        return None
+    if not embedding_items:
+        return (None, input_ids)
+
+    device = input_ids.device
+    pending_requests = []
+    all_miss_items = []
+    all_miss_lengths = []
+
+    for i in range(max_iterations):
+        if items_size[i] == items_size[i + 1]:
+            continue
+
+        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
+        if extend_seq_len <= 0:
+            continue
+
+        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
+        items_offset = items_offset_list[i]
+        assert items_offset is not None, items_offset
+
+        if not all(
+            item.offsets is not None and len(item.offsets) == 1
+            for item in embedding_items_per_req
+        ):
+            return None
+
+        chunk_start = prefix_length[i]
+        chunk_end = chunk_start + extend_seq_len
+        chunk_entries = []
+
+        for item, (start, end) in zip(embedding_items_per_req, items_offset):
+            if end < chunk_start or start >= chunk_end:
+                continue
+
+            item_len = _get_qwen_like_image_embedding_len(data_embedding_func, item)
+            if item_len is None:
+                return None
+            if end - start + 1 != item_len:
+                return None
+
+            cached = embedding_cache.get_single(item.hash)
+            if cached is not None:
+                if cached.embedding.shape[0] != item_len:
+                    return None
+                chunk_entries.append((item, cached.embedding, start, end))
+                continue
+
+            all_miss_items.append(item)
+            all_miss_lengths.append(item_len)
+            chunk_entries.append((item, None, start, end))
+
+        if chunk_entries:
+            pending_requests.append((chunk_entries, chunk_start, chunk_end))
+
+    miss_embeddings = []
+    if all_miss_items:
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(all_miss_items, device)
+        all_miss_embedding = data_embedding_func(all_miss_items)
+        if not isinstance(all_miss_embedding, torch.Tensor):
+            return None
+        all_miss_embedding = all_miss_embedding.reshape(
+            -1, all_miss_embedding.shape[-1]
+        )
+        if sum(all_miss_lengths) != all_miss_embedding.shape[0]:
+            logger.warning(
+                "Cross-request ViT batching disabled for this batch because "
+                f"split lengths {sum(all_miss_lengths)} do not match embedding "
+                f"length {all_miss_embedding.shape[0]}."
+            )
+            return None
+
+        miss_embeddings = list(
+            torch.split(all_miss_embedding, all_miss_lengths, dim=0)
+        )
+        for item, emb in zip(all_miss_items, miss_embeddings):
+            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+
+    embedding_list = []
+    miss_iter = iter(miss_embeddings)
+    for chunk_entries, chunk_start, chunk_end in pending_requests:
+        filled_entries = []
+        for item, emb, start, end in chunk_entries:
+            if emb is None:
+                emb = next(miss_iter)
+            filled_entries.append((item, emb, start, end))
+
+        chunk_embedding = _assemble_cross_request_chunk_embedding(
+            filled_entries, chunk_start, chunk_end
+        )
+        if chunk_embedding is None:
+            return None
+        embedding_list.append(chunk_embedding)
+
+    if len(embedding_list) == 0:
+        return (None, input_ids)
+    return torch.concat(embedding_list, dim=0), input_ids
+
+
 def _get_chunked_prefill_embedding(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items: List[MultimodalDataItem],
@@ -638,6 +825,19 @@ def _get_chunked_prefill_embedding(
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
+
+    cross_request_result = _get_chunked_prefill_embedding_cross_request_vit(
+        data_embedding_func,
+        embedding_items,
+        items_size,
+        prefix_length,
+        extend_length,
+        items_offset_list,
+        input_ids,
+        max_iterations,
+    )
+    if cross_request_result is not None:
+        return cross_request_result
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
