@@ -275,7 +275,7 @@ general_mm_embed_routine(...)
 ## 4. 个人总结
 
 + Vision Encoder 相对 LLM 参数和计算较轻，但由于图像 patch 序列长，activation 和 TP 通信开销不小，TP 效率可能偏低。因此视觉侧更适合采用 request/image-level batching 或 data-parallel encoder，而不是简单沿用 LLM TP。
-+ 对于小 batch ViT，大概率是 host-bound，CUDA graph 与跨请求 ViT batching 能改善利用率。在 Qwen2.5-VL-72B 上测试跨请求合并，满并发 8/128 分别带来 5%/9% 吞吐提升。
++ 对于小 batch ViT，大概率是 host-bound，CUDA graph 与跨请求 ViT batching 能改善利用率。当前sglang还没有集成跨请求合并，在 Qwen2.5-VL-72B 上实现了一个快速路径，满并发 8/128 分别带来 5%/9% 吞吐提升。
 
 
 
