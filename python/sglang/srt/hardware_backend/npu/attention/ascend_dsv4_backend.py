@@ -1625,9 +1625,30 @@ class DeepseekV4AscendAttnBackend(
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
+    def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Return the SWA KV write locations used by DeepSeek-V4 draft layers.
+
+        During NPU graph capture/replay, ``swa_loc`` is stable graph storage
+        whose contents are refreshed by ``_apply_dsv4_graph_metadata``. Eager
+        forwards do not necessarily build that metadata, so translate the
+        current full-pool locations on demand as a fallback.
+        """
+        out_cache_loc = forward_batch.out_cache_loc
+        metadata = self.forward_metadata
+        cached = getattr(metadata, "swa_loc", None)
+        if (
+            cached is not None
+            and not forward_batch.forward_mode.is_idle()
+            and cached.shape[0] == out_cache_loc.shape[0]
+        ):
+            return cached
+        return self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            out_cache_loc
+        ).to(torch.int64)
+
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
-        swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        swa_loc = self.get_swa_out_cache_loc(forward_batch)
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,

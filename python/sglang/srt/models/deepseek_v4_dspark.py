@@ -48,19 +48,57 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_blackwell_supported
+from sglang.srt.utils import add_prefix, is_blackwell_supported, is_npu
 from sglang.srt.utils.async_probe import maybe_detect_in_closed_range
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
+_is_npu = is_npu()
 
 
 def apply_rotary_emb(
-    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool = False,
 ) -> torch.Tensor:
+    if _is_npu:
+        import torch_npu
+
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            _get_contig_freqs_real_imag,
+        )
+
+        # aclnnIndex does not support complex64, so split the full frequency
+        # table into contiguous real/imag tensors before indexing it.
+        freqs_real, freqs_imag = _get_contig_freqs_real_imag(freqs_cis)
+        cos_half = freqs_real[positions].to(x.dtype)
+        sin_half = freqs_imag[positions].to(x.dtype)
+        if inverse:
+            sin_half = -sin_half
+
+        rope_dim = x.shape[-1]
+        cos = (
+            cos_half.repeat_interleave(2, dim=-1)
+            .view(-1, 1, 1, rope_dim)
+            .contiguous()
+        )
+        sin = (
+            sin_half.repeat_interleave(2, dim=-1)
+            .view(-1, 1, 1, rope_dim)
+            .contiguous()
+        )
+        x_3d = x.reshape(x.shape[0], -1, rope_dim)
+        rotated = torch_npu.npu_rotary_mul(
+            x_3d.unsqueeze(1), cos, sin, rotary_mode="interleave"
+        )
+        x.copy_(rotated.squeeze(1).view_as(x))
+        return x
+
     y = x
     x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    freqs_cis = freqs_cis[positions]
     if inverse:
         freqs_cis = freqs_cis.conj()
     if x.ndim == 3:
@@ -170,7 +208,9 @@ class DSparkAttention(MqaAttentionBase):
             q = q * torch.rsqrt(
                 q.float().square().mean(-1, keepdim=True) + self.eps
             ).to(q.dtype)
-            apply_rotary_emb(q[..., -self.rope_head_dim :], self.freqs_cis[positions])
+            apply_rotary_emb(
+                q[..., -self.rope_head_dim :], self.freqs_cis, positions
+            )
             if q_out is not None:
                 q_out.copy_(q)
                 return q_out
@@ -250,7 +290,9 @@ class DSparkAttention(MqaAttentionBase):
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
             )
         else:
-            apply_rotary_emb(o[..., -rd:], self.freqs_cis[positions], inverse=True)
+            apply_rotary_emb(
+                o[..., -rd:], self.freqs_cis, positions, inverse=True
+            )
 
         o = o.view(
             o.shape[0],
@@ -551,8 +593,17 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.dim)
+        input_ids = forward_batch.input_ids
+        if input_ids is None:
+            raise RuntimeError(
+                "DeepSeek-V4 DSpark MoE requires forward_batch.input_ids for "
+                "hash routing and TP-attention/A2A token scatter."
+            )
         y = self._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=None, input_ids_global=None
+            x,
+            forward_batch,
+            input_ids=input_ids,
+            input_ids_global=input_ids,
         )
         return y.view(shape)
 
