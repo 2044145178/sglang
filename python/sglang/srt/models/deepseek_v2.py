@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -233,6 +234,32 @@ from sglang.jit_kernel.fused_a_gemm import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_npu_moe_detail_probe(
+    phase: str, layer_id: int, tensor: torch.Tensor, *, is_nextn: bool
+):
+    """Synchronize fine-grained MoE boundaries for NPU hang diagnosis."""
+    if not _is_npu or os.getenv("SGLANG_DSV4_NPU_LAYER_PROBE", "0") != "1":
+        return
+    rank = get_parallel().attn_tp_rank
+    logger.warning(
+        "DSV4 MoE detail probe: rank=%s layer=%s model=%s phase=%s "
+        "shape=%s sync_begin",
+        rank,
+        layer_id,
+        "draft" if is_nextn else "target",
+        phase,
+        tuple(tensor.shape),
+    )
+    torch.get_device_module(tensor.device.type).synchronize()
+    logger.warning(
+        "DSV4 MoE detail probe: rank=%s layer=%s model=%s phase=%s sync_end",
+        rank,
+        layer_id,
+        "draft" if is_nextn else "target",
+        phase,
+    )
 
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
@@ -1204,6 +1231,12 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        _debug_npu_moe_detail_probe(
+            "router_begin",
+            self.layer_id,
+            hidden_states,
+            is_nextn=self.is_nextn,
+        )
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
@@ -1216,6 +1249,12 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+            _debug_npu_moe_detail_probe(
+                "gate_done",
+                self.layer_id,
+                hidden_states,
+                is_nextn=self.is_nextn,
+            )
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1247,6 +1286,12 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
             )
+        _debug_npu_moe_detail_probe(
+            "topk_done",
+            self.layer_id,
+            hidden_states,
+            is_nextn=self.is_nextn,
+        )
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
@@ -1396,9 +1441,21 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
+        _debug_npu_moe_detail_probe(
+            "experts_begin",
+            self.layer_id,
+            hidden_states,
+            is_nextn=self.is_nextn,
+        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
+        )
+        _debug_npu_moe_detail_probe(
+            "experts_done",
+            self.layer_id,
+            final_hidden_states,
+            is_nextn=self.is_nextn,
         )
 
         if (
@@ -1424,6 +1481,12 @@ class DeepseekV2MoE(nn.Module):
             ):
                 final_hidden_states *= self.routed_scaling_factor
 
+        _debug_npu_moe_detail_probe(
+            "output_done",
+            self.layer_id,
+            final_hidden_states,
+            is_nextn=self.is_nextn,
+        )
         return final_hidden_states
 
     def _forward_shared_experts(

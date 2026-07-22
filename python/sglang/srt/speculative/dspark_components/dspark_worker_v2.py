@@ -441,11 +441,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._debug_phase_probe("prefill_positions_done")
         self._debug_phase_probe("prefill_kv_inject_begin")
-        self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
-            cache_loc=batch.out_cache_loc,
-            positions=positions,
-        )
+        if os.getenv("SGLANG_DSPARK_BYPASS_DRAFT_RUNTIME", "0") == "1":
+            if self.ps.tp_rank == 0:
+                logger.warning("DSpark prefill draft KV injection bypassed.")
+        else:
+            self._kv_injector.inject_target_hidden(
+                target_hidden=logits_output.hidden_states,
+                cache_loc=batch.out_cache_loc,
+                positions=positions,
+            )
         self._debug_phase_probe("prefill_kv_inject_done")
         logits_output.hidden_states = None
 
@@ -661,7 +665,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._debug_phase_probe("publish_done")
 
         folded_commit = folded_accept and epilogue.folds_commit
-        if not folded_commit:
+        bypass_draft_runtime = (
+            os.getenv("SGLANG_DSPARK_BYPASS_DRAFT_RUNTIME", "0") == "1"
+        )
+        if bypass_draft_runtime:
+            if self.ps.tp_rank == 0:
+                logger.warning("DSpark decode draft KV commit bypassed.")
+        elif not folded_commit:
             self._verify_executor.commit_hidden(
                 batch=batch,
                 layout=layout,

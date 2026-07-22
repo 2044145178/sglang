@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Optional
 
@@ -255,6 +256,47 @@ class DraftBlockProposer:
         target_model,
         sampling_info,
     ) -> DraftProposal:
+        if os.getenv("SGLANG_DSPARK_BYPASS_DRAFT_RUNTIME", "0") == "1":
+            if sampling_info is not None and not sampling_info.is_all_greedy:
+                raise ValueError(
+                    "SGLANG_DSPARK_BYPASS_DRAFT_RUNTIME only supports greedy "
+                    "sampling."
+                )
+
+            draft_block_ids = torch.full(
+                (bs, self.gamma),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+            draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+            draft_tokens = torch.zeros(
+                (bs, self.gamma), dtype=torch.long, device=device
+            )
+            if get_parallel().tp_rank == 0:
+                logger.warning(
+                    "DSpark draft runtime bypassed: bs=%d gamma=%d",
+                    bs,
+                    self.gamma,
+                )
+            return DraftProposal(
+                draft_block_ids=draft_block_ids,
+                draft_block=DraftBlockResult(
+                    draft_tokens=draft_tokens,
+                    corrected_logits=None,
+                    greedy_mask=torch.ones(bs, dtype=torch.bool, device=device),
+                    temperatures=torch.ones(
+                        bs, dtype=torch.float32, device=device
+                    ),
+                ),
+                draft_hidden=None,
+                confidence=torch.zeros(
+                    (bs, self.gamma), dtype=torch.float32, device=device
+                ),
+                confidence_tap=None,
+                folded=False,
+            )
+
         embed_module = target_model.get_input_embeddings()
         fwd = self._run_forward(
             batch=batch,
