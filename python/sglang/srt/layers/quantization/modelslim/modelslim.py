@@ -122,6 +122,29 @@ class ModelSlimConfig(QuantizationConfig):
                     "forward_npu",
                     [npu_wrapper_rmsnorm_forward],
                 )
+        # DSpark checkpoint weights use mtp.<stage>.*, while the runtime
+        # draft model constructs modules under stages.<stage>.*.
+        dspark_quant_aliases = {}
+        for name, scheme in quant_config.items():
+            if not isinstance(name, str) or not name.startswith("mtp."):
+                continue
+
+            parts = name.split(".", 2)
+            if len(parts) != 3:
+                continue
+
+            stage_id, rest = parts[1], parts[2]
+            if not stage_id.isdigit():
+                continue
+
+            dspark_quant_aliases[f"stages.{stage_id}.{rest}"] = scheme
+
+        quant_config = {
+            **quant_config,
+            **dspark_quant_aliases,
+        }
+
+        self.quant_description = quant_config
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)

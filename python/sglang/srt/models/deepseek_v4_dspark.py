@@ -594,6 +594,13 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         shape = x.shape
         x = x.reshape(-1, self.dim)
         input_ids = forward_batch.input_ids
+        logger.warning(
+            "DSpark stage=%d MoE enter: input_ids=%s hidden=%s original_shape=%s",
+            self.layer_id,
+            input_ids.shape,
+            x.shape,
+            shape,
+        )
         if input_ids is None:
             raise RuntimeError(
                 "DeepSeek-V4 DSpark MoE requires forward_batch.input_ids for "
@@ -936,7 +943,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
+        # Only standalone FP8 scale tensors use the ``weight_scale_inv``
+        # runtime name.  W4A8 MoE also stores ``scale_bias`` tensors; a broad
+        # string replacement would corrupt those names into
+        # ``weight_scale_inv_bias`` and leave w13/w2_scale_bias uninitialized.
+        if mapped_rest.endswith(".scale"):
+            mapped_rest = (
+                mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
+            )
         return f"stages.{stage_id}.{mapped_rest}"
 
 

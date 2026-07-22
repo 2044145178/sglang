@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Optional
@@ -60,6 +61,22 @@ logger = logging.getLogger(__name__)
 
 
 class DSparkWorkerV2(BaseSpecWorker):
+
+    def _debug_phase_probe(self, phase: str) -> None:
+        """Synchronize and log coarse DSpark decode phases on every rank.
+
+        This is intentionally opt-in because synchronizing after every phase is
+        expensive and changes overlap behavior.  It is useful on NPU where an
+        asynchronous device/HCCL failure may otherwise be reported much later
+        at an unrelated synchronization point.
+        """
+        if os.getenv("SGLANG_DSPARK_NPU_PHASE_PROBE", "0") != "1":
+            return
+
+        rank = self.ps.tp_rank
+        logger.warning("DSpark phase probe: rank=%s phase=%s sync_begin", rank, phase)
+        torch.get_device_module(self.device).synchronize()
+        logger.warning("DSpark phase probe: rank=%s phase=%s sync_end", rank, phase)
 
     def __init__(
         self,
@@ -359,6 +376,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
     ) -> GenerationBatchResult:
+        self._debug_phase_probe(
+            "forward_generation_enter_"
+            + ("extend" if batch.forward_mode.is_extend() else "decode")
+        )
         if getattr(batch, "return_logprob", False):
             raise ValueError(
                 "DSpark speculative decoding does not support return_logprob yet."
@@ -374,21 +395,26 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
     ) -> GenerationBatchResult:
+        self._debug_phase_probe("prefill_begin")
         if batch.forward_mode.is_idle():
             if self.server_args.enable_dp_attention:
                 self.target_worker.forward_batch_generation(
                     batch, capture_hidden_mode=CaptureHiddenMode.FULL
                 )
+                self._debug_phase_probe("prefill_idle_target_done")
             return self._decode_idle_result(on_publish=on_publish)
 
+        self._debug_phase_probe("target_prefill_begin")
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
+        self._debug_phase_probe("target_prefill_done")
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
+        self._debug_phase_probe("prefill_publish_done")
 
         if logits_output.hidden_states is None:
             raise RuntimeError(
@@ -413,17 +439,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        self._debug_phase_probe("prefill_positions_done")
+        self._debug_phase_probe("prefill_kv_inject_begin")
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
             positions=positions,
         )
+        self._debug_phase_probe("prefill_kv_inject_done")
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
         )
+        self._debug_phase_probe("prefill_result_ready")
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
@@ -506,6 +536,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         target_model = self.target_worker.model_runner.model
 
+        self._debug_phase_probe("decode_begin")
+
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -514,8 +546,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
         )
+        self._debug_phase_probe("verify_window_done")
 
         sampling_info = batch.sampling_info
+        self._debug_phase_probe("draft_begin")
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -526,6 +560,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_model=target_model,
                 sampling_info=sampling_info,
             )
+        self._debug_phase_probe("draft_done")
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
@@ -538,6 +573,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 confidence_tap=proposal.confidence_tap,
             )
+        self._debug_phase_probe("confidence_done")
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -545,6 +581,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             req_pool_indices=batch.req_pool_indices,
         )
+        self._debug_phase_probe("verify_budget_done")
 
         global_num_reqs = (
             max(batch.global_num_tokens)
@@ -562,6 +599,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+        self._debug_phase_probe("verify_layout_done")
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = torch.cat(
@@ -574,6 +612,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
         )
+        self._debug_phase_probe("target_verify_begin")
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -595,6 +634,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     sampling_info=sampling_info,
                 )
                 hidden_strided = None
+        self._debug_phase_probe("target_verify_done")
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
@@ -612,11 +652,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        self._debug_phase_probe("accept_done")
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
                 on_publish(accept.new_seq_lens)
+        self._debug_phase_probe("publish_done")
 
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
@@ -630,6 +672,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bs=bs,
                 run_compact=run_compact,
             )
+        self._debug_phase_probe("commit_hidden_done")
         logits_output.hidden_states = None
 
         self._observers.observe_verify_step(
@@ -654,11 +697,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+        self._debug_phase_probe("observe_done")
 
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
+        self._debug_phase_probe("decode_result_ready")
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),

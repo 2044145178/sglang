@@ -260,7 +260,17 @@ class EagerRunner(BaseRunner):
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
-        if forward_batch.needs_forward_metadata_init():
+        force_dsv4_npu_verify_replan = (
+            forward_batch.forward_mode.is_target_verify()
+            and hasattr(
+                model_runner.attn_backend,
+                "_build_npu_compress_metadata_verify",
+            )
+        )
+        if (
+            force_dsv4_npu_verify_replan
+            or forward_batch.needs_forward_metadata_init()
+        ):
             if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
