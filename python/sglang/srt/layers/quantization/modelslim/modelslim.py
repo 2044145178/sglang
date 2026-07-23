@@ -152,14 +152,26 @@ class ModelSlimConfig(QuantizationConfig):
                 alias = f"confidence_head.{rest[len('confidence_head.'):]}"
             else:
                 mapped_rest = rest
-                mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
-                mapped_rest = mapped_rest.replace("ffn.", "mlp.", 1)
-                mapped_rest = mapped_rest.replace(
-                    "attn_norm.", "input_layernorm.", 1
-                )
-                mapped_rest = mapped_rest.replace(
-                    "ffn_norm.", "post_attention_layernorm.", 1
-                )
+                # The generic DeepSeek-V4 ModelSlim preprocessing may already
+                # have canonicalized these prefixes.  Use anchored,
+                # idempotent rewrites; a substring replacement would turn
+                # ``self_attn`` into ``self_self_attn``.
+                if mapped_rest.startswith("attn."):
+                    mapped_rest = (
+                        "self_attn." + mapped_rest.removeprefix("attn.")
+                    )
+                elif mapped_rest.startswith("ffn."):
+                    mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
+                elif mapped_rest.startswith("attn_norm."):
+                    mapped_rest = (
+                        "input_layernorm."
+                        + mapped_rest.removeprefix("attn_norm.")
+                    )
+                elif mapped_rest.startswith("ffn_norm."):
+                    mapped_rest = (
+                        "post_attention_layernorm."
+                        + mapped_rest.removeprefix("ffn_norm.")
+                    )
                 mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
                 mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
                 mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")

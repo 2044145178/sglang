@@ -33,6 +33,10 @@ class TestDeepseekV4DsparkWeightMapping(CustomTestCase):
             self.remap("mtp.0.attn.wq_a.scale"),
             "stages.0.self_attn.wq_a.weight_scale_inv",
         )
+        self.assertEqual(
+            self.remap("mtp.0.self_attn.wq_a.scale"),
+            "stages.0.self_attn.wq_a.weight_scale_inv",
+        )
 
     def test_mtp_local_shared_modules_are_ignored(self):
         self.assertIsNone(self.remap("mtp.0.embed.weight"))
@@ -41,6 +45,9 @@ class TestDeepseekV4DsparkWeightMapping(CustomTestCase):
     def test_modelslim_dspark_quant_description_aliases(self):
         config = ModelSlimConfig(
             {
+                # Triggers the generic DeepSeek-V4 name preprocessing that
+                # canonicalizes attn -> self_attn before DSpark aliases run.
+                "hc_head_fn": "FLOAT",
                 "mtp.0.attn.wq_a.weight": "W8A8_DYNAMIC",
                 "mtp.1.ffn.experts.0.w1.weight": "W4A8_DYNAMIC",
                 "mtp.1.ffn.experts.0.w2.weight": "W4A8_DYNAMIC",
@@ -58,6 +65,14 @@ class TestDeepseekV4DsparkWeightMapping(CustomTestCase):
         for name, scheme in expected.items():
             with self.subTest(name=name):
                 self.assertEqual(config.quant_description.get(name), scheme)
+
+        self.assertFalse(
+            any(
+                "self_self_attn" in name
+                for name in config.quant_description
+                if isinstance(name, str)
+            )
+        )
 
 
 if __name__ == "__main__":
