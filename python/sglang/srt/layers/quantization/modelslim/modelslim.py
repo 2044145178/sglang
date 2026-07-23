@@ -122,8 +122,13 @@ class ModelSlimConfig(QuantizationConfig):
                     "forward_npu",
                     [npu_wrapper_rmsnorm_forward],
                 )
-        # DSpark checkpoint weights use mtp.<stage>.*, while the runtime
-        # draft model constructs modules under stages.<stage>.*.
+        # DSpark checkpoint weights use mtp.<stage>.*, while the runtime draft
+        # model constructs canonical modules under stages.<stage>.*.  Keep
+        # this transformation in sync with
+        # DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name.  Merely
+        # replacing ``mtp`` with ``stages`` is insufficient: it silently
+        # misses ModelSlim lookups such as stages.0.mlp.experts and
+        # stages.0.self_attn.
         dspark_quant_aliases = {}
         for name, scheme in quant_config.items():
             if not isinstance(name, str) or not name.startswith("mtp."):
@@ -137,11 +142,42 @@ class ModelSlimConfig(QuantizationConfig):
             if not stage_id.isdigit():
                 continue
 
-            dspark_quant_aliases[f"stages.{stage_id}.{rest}"] = scheme
+            # The draft model attaches the target model's shared embedding and
+            # LM head; mtp-local copies are not runtime draft modules.
+            if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+                continue
+            if rest.startswith("markov_head."):
+                alias = f"markov_head.{rest[len('markov_head.'):]}"
+            elif rest.startswith("confidence_head."):
+                alias = f"confidence_head.{rest[len('confidence_head.'):]}"
+            else:
+                mapped_rest = rest
+                mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
+                mapped_rest = mapped_rest.replace("ffn.", "mlp.", 1)
+                mapped_rest = mapped_rest.replace(
+                    "attn_norm.", "input_layernorm.", 1
+                )
+                mapped_rest = mapped_rest.replace(
+                    "ffn_norm.", "post_attention_layernorm.", 1
+                )
+                mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
+                mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
+                mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
+                mapped_rest = mapped_rest.replace(
+                    ".gate.tid2eid", ".topk.tid2eid"
+                )
+                mapped_rest = mapped_rest.replace(
+                    ".gate.bias", ".gate.e_score_correction_bias"
+                )
+                alias = f"stages.{stage_id}.{mapped_rest}"
 
+            dspark_quant_aliases[alias] = scheme
+
+        # An explicitly exported canonical runtime key takes precedence over
+        # the compatibility alias derived from an mtp key.
         quant_config = {
-            **quant_config,
             **dspark_quant_aliases,
+            **quant_config,
         }
 
         self.quant_description = quant_config
