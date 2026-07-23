@@ -3,7 +3,6 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
-import os
 import time
 from contextlib import nullcontext
 from typing import (
@@ -193,28 +192,6 @@ def _get_mhc_ops() -> MhcOps:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _debug_npu_target_layer_probe(phase: str, layer_id: int, tensor: torch.Tensor):
-    """Synchronize target-model layer boundaries for NPU hang diagnosis."""
-    if not _is_npu or os.getenv("SGLANG_DSV4_NPU_LAYER_PROBE", "0") != "1":
-        return
-
-    rank = get_parallel().attn_tp_rank
-    logger.warning(
-        "DSV4 target layer probe: rank=%s layer=%s phase=%s shape=%s sync_begin",
-        rank,
-        layer_id,
-        phase,
-        tuple(tensor.shape),
-    )
-    torch.get_device_module(tensor.device.type).synchronize()
-    logger.warning(
-        "DSV4 target layer probe: rank=%s layer=%s phase=%s sync_end",
-        rank,
-        layer_id,
-        phase,
-    )
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
@@ -1582,7 +1559,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
-        _debug_npu_target_layer_probe("layer_begin", self.layer_id, hidden_states)
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
@@ -1629,17 +1605,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        _debug_npu_target_layer_probe(
-            "attention_prepared", self.layer_id, hidden_states
-        )
         hidden_states = self.self_attn(
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
-        )
-        _debug_npu_target_layer_probe(
-            "attention_done", self.layer_id, hidden_states
         )
 
         if use_fused:
@@ -1696,27 +1666,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
-        _debug_npu_target_layer_probe(
-            "ffn_prepared", self.layer_id, hidden_states
-        )
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
-        _debug_npu_target_layer_probe("moe_done", self.layer_id, hidden_states)
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
-            _debug_npu_target_layer_probe(
-                "layer_done", self.layer_id, hidden_states
-            )
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
-        _debug_npu_target_layer_probe("layer_done", self.layer_id, hidden_states)
         return hidden_states, residual, post, comb
 
     def _run_moe_ffn_dp_sync(
@@ -1727,9 +1689,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        _debug_npu_target_layer_probe(
-            "moe_enter", self.layer_id, hidden_states
-        )
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
@@ -1804,9 +1763,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-        _debug_npu_target_layer_probe(
-            "moe_dp_gather_done", self.layer_id, hidden_states
-        )
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -1814,15 +1770,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
-        _debug_npu_target_layer_probe(
-            "moe_tp_scatter_done", self.layer_id, hidden_states
-        )
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
-        _debug_npu_target_layer_probe(
-            "moe_core_begin", self.layer_id, hidden_states
-        )
         with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
             hidden_states = self.mlp(
                 hidden_states,
@@ -1831,9 +1781,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
             )
-        _debug_npu_target_layer_probe(
-            "moe_core_done", self.layer_id, hidden_states
-        )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -1870,24 +1817,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             if _shared_local is not None:
                 n = hidden_states.shape[0]
                 hidden_states = hidden_states + _shared_local[:n]
-        _debug_npu_target_layer_probe(
-            "moe_dp_combine_done", self.layer_id, hidden_states
-        )
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
-            _debug_npu_target_layer_probe(
-                "moe_tp_allgather_begin", self.layer_id, hidden_states
-            )
             attn_tp_all_gather(gathered, hidden_states.contiguous())
-            _debug_npu_target_layer_probe(
-                "moe_tp_allgather_done", self.layer_id, hidden_states
-            )
             hidden_states = torch.cat(gathered)
-            _debug_npu_target_layer_probe(
-                "moe_tp_concat_done", self.layer_id, hidden_states
-            )
-        _debug_npu_target_layer_probe("moe_exit", self.layer_id, hidden_states)
         return hidden_states
 
     # ------------------------------------------------------------------

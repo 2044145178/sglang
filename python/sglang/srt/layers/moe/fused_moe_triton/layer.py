@@ -3,7 +3,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
-import os
 from enum import Enum
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple
@@ -92,31 +91,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-logger = logging.getLogger(__name__)
-
-
-def _debug_npu_moe_kernel_probe(
-    phase: str, layer_id: int, tensor: torch.Tensor
-) -> None:
-    """Synchronize dispatcher/expert boundaries for NPU hang diagnosis."""
-    if not _is_npu or os.getenv("SGLANG_DSV4_NPU_LAYER_PROBE", "0") != "1":
-        return
-    rank = get_parallel().attn_tp_rank
-    logger.warning(
-        "DSV4 MoE kernel probe: rank=%s layer=%s phase=%s shape=%s sync_begin",
-        rank,
-        layer_id,
-        phase,
-        tuple(tensor.shape),
-    )
-    torch.get_device_module(tensor.device.type).synchronize()
-    logger.warning(
-        "DSV4 MoE kernel probe: rank=%s layer=%s phase=%s sync_end",
-        rank,
-        layer_id,
-        phase,
-    )
 
 
 def _get_deepep_comm_group(a2a_backend):
@@ -1370,10 +1344,6 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
-        _debug_npu_moe_kernel_probe(
-            "dispatch_begin", self.layer_id, hidden_states
-        )
-
         if self._dwdp_bound:
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
@@ -1382,15 +1352,9 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        _debug_npu_moe_kernel_probe(
-            "dispatch_done", self.layer_id, hidden_states
-        )
-
-        _debug_npu_moe_kernel_probe("expert_core_begin", self.layer_id, hidden_states)
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
         )
-        _debug_npu_moe_kernel_probe("expert_core_done", self.layer_id, hidden_states)
 
         if self._dwdp_bound:
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
@@ -1398,13 +1362,7 @@ class FusedMoE(torch.nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            _debug_npu_moe_kernel_probe(
-                "combine_begin", self.layer_id, hidden_states
-            )
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
-            _debug_npu_moe_kernel_probe(
-                "combine_done", self.layer_id, final_hidden_states
-            )
 
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[
@@ -1412,17 +1370,8 @@ class FusedMoE(torch.nn.Module):
             ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-            _debug_npu_moe_kernel_probe(
-                "post_reduce_begin", self.layer_id, final_hidden_states
-            )
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-            _debug_npu_moe_kernel_probe(
-                "post_reduce_done", self.layer_id, final_hidden_states
-            )
 
-        _debug_npu_moe_kernel_probe(
-            "experts_exit", self.layer_id, final_hidden_states
-        )
         return final_hidden_states
 
     def forward_deferred_finalize(

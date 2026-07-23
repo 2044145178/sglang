@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Iterable, List, Optional, Tuple
 
 import msgspec
@@ -594,23 +593,7 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.dim)
-        if os.getenv("SGLANG_DSPARK_STUB_DRAFT_MOE", "0") == "1":
-            logger.warning(
-                "DSpark draft MoE stubbed: stage=%d hidden=%s original_shape=%s",
-                self.layer_id,
-                tuple(x.shape),
-                tuple(shape),
-            )
-            return torch.zeros_like(x).view(shape)
-
         input_ids = forward_batch.input_ids
-        logger.warning(
-            "DSpark stage=%d MoE enter: input_ids=%s hidden=%s original_shape=%s",
-            self.layer_id,
-            input_ids.shape,
-            x.shape,
-            shape,
-        )
         if input_ids is None:
             raise RuntimeError(
                 "DeepSeek-V4 DSpark MoE requires forward_batch.input_ids for "
@@ -765,22 +748,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         del get_embedding, pp_proxy_tensors
-        if os.getenv("SGLANG_DSPARK_STUB_DRAFT_FORWARD", "0") == "1":
-            hidden_states = torch.zeros(
-                (input_ids.numel(), self.hc_mult, self.config.hidden_size),
-                dtype=self.stages[0].input_layernorm.weight.dtype,
-                device=input_ids.device,
-            )
-            logger.warning(
-                "DSpark draft forward stubbed: input_ids=%s hidden=%s",
-                tuple(input_ids.shape),
-                tuple(hidden_states.shape),
-            )
-            return LogitsProcessorOutput(
-                next_token_logits=None,
-                hidden_states=hidden_states,
-            )
-
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
