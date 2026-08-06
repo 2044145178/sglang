@@ -218,7 +218,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
-            and is_cuda()
+            and (is_cuda() or _is_npu)
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
@@ -350,7 +350,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             if capture_decode_cuda_graph:
                 self._draft_sampler = (
                     self._maybe_build_draft_sampler()
-                    if is_cuda()
+                    if is_cuda() or _is_npu
                     else None
                 )
                 if self._draft_sampler is not None:

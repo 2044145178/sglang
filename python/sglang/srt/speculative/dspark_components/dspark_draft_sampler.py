@@ -146,7 +146,9 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
-    available_gb = get_available_gpu_memory(device, torch.cuda.current_device())
+    available_gb = get_available_gpu_memory(
+        device, torch.get_device_module().current_device()
+    )
     if available_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:
@@ -191,7 +193,7 @@ def maybe_build_draft_sampler(
     )
     if tp_rank == 0:
         logger.info(
-            "DSpark draft proposal (%s) folded into the draft cuda graph.",
+            "DSpark draft proposal (%s) folded into the draft decode graph.",
             "greedy + sampling" if folded_sampling else "greedy only",
         )
     return DsparkDraftSampler(
