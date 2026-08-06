@@ -1920,13 +1920,21 @@ class DeepseekV4AscendAttnBackend(
                     f"forward_bs={forward_batch.batch_size}, "
                     f"layout_bs={ragged_layout.bs}."
                 )
-            if forward_batch.input_ids.numel() != ragged_layout.graph_num_tokens:
+            physical_tokens = int(forward_batch.input_ids.numel())
+            layout_tokens = int(ragged_layout.graph_num_tokens)
+            # DP/EP MLP synchronization may append token rows after the
+            # compact layout is built.  Keep those physical rows for the MoE
+            # collectives, while the ragged Q indptr / seqused metadata below
+            # continues to describe only the valid compact prefix.
+            valid_tokens = getattr(forward_batch, "_original_num_tokens", None)
+            if valid_tokens is None:
+                valid_tokens = forward_batch.num_token_non_padded_cpu
+            valid_tokens = int(valid_tokens)
+            if physical_tokens < layout_tokens or valid_tokens != layout_tokens:
                 raise RuntimeError(
-                    "DSpark NPU eager compact verify does not yet support "
-                    "post-layout token padding: "
-                    f"input_tokens={forward_batch.input_ids.numel()}, "
-                    f"layout_tokens={ragged_layout.graph_num_tokens}. "
-                    "Disable DP/EP token padding while validating eager compact."
+                    "Invalid DSpark NPU eager compact token geometry: "
+                    f"physical_tokens={physical_tokens}, "
+                    f"valid_tokens={valid_tokens}, layout_tokens={layout_tokens}."
                 )
         # cu_seqlens_q must hold per-request QUERY token counts, not KV lengths.
         if (
