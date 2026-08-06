@@ -406,12 +406,14 @@ class AscendAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
+        metadata_key = self._cuda_graph_metadata_key(forward_batch)
         if in_capture:
             self._init_cuda_graph_metadata(
                 bs,
                 forward_batch.forward_mode,
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
+                metadata_key=metadata_key,
             )
         self._apply_cuda_graph_metadata(
             bs=bs,
@@ -425,7 +427,17 @@ class AscendAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+            metadata_key=metadata_key,
         )
+
+    def _cuda_graph_metadata_key(self, forward_batch: ForwardBatch):
+        """Return the stable attention-metadata slot for a captured graph.
+
+        Most backends capture one graph per padded batch size. Token-tiered
+        ragged verify backends override this hook because several token tiers
+        may share the same padded request-slot count.
+        """
+        return forward_batch.batch_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -611,6 +623,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
+        metadata_key=None,
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
@@ -672,7 +685,7 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=dtype,
                 device=seq_lens.device,
             )
-        self.graph_metadata[bs] = metadata
+        self.graph_metadata[bs if metadata_key is None else metadata_key] = metadata
         return metadata
 
     def _apply_cuda_graph_metadata(
@@ -684,12 +697,13 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        metadata_key=None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
-        metadata = self.graph_metadata[bs]
+        metadata = self.graph_metadata[bs if metadata_key is None else metadata_key]
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -738,7 +752,24 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
+            ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+            if ragged_layout is not None:
+                if ragged_layout.bs != bs:
+                    ragged_layout = ragged_layout.padded_to_bucket(
+                        padded_bs=bs,
+                        cap=int(
+                            getattr(
+                                spec_info,
+                                "draft_token_num",
+                                self.speculative_num_draft_tokens,
+                            )
+                            or self.speculative_num_draft_tokens
+                            or 1
+                        ),
+                    )
+                seq_lens = seq_lens + ragged_layout.verify_lens.to(seq_lens.dtype)
+            else:
+                seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
