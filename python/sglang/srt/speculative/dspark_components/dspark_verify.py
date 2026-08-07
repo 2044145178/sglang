@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from typing import Optional
 
 import msgspec
@@ -41,6 +43,7 @@ from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
@@ -384,12 +387,33 @@ class TargetVerifyExecutor:
         )
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
+            graph_runner = getattr(
+                self.model_runner, "decode_cuda_graph_runner", None
+            )
+            self.verify_epilogue.debug_start_step(
+                bs=bs,
+                graph_runner=graph_runner,
+                extra=(
+                    f"inject_gate={inject_gate} layout_tokens="
+                    f"{layout.total_verify_tokens}"
+                ),
+            )
         target_verify = self._run_ragged(
             batch=batch,
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
         )
+        if self.verify_epilogue is not None:
+            self.verify_epilogue.debug_snapshot(
+                stage=(
+                    "after_replay"
+                    if target_verify.can_run_cuda_graph
+                    else "after_eager_forward"
+                ),
+                bs=bs,
+                extra=f"can_run_cuda_graph={target_verify.can_run_cuda_graph}",
+            )
         logits_output = target_verify.logits_output
 
         stride = self.verify_num_draft_tokens
@@ -465,11 +489,29 @@ class DsparkVerifyEpilogue:
         verify_num_draft_tokens: int,
         device,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        tp_rank: int = 0,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
+        self.tp_rank = int(tp_rank)
+        self._probe_enabled = os.getenv(
+            "SGLANG_DSPARK_EPILOGUE_PROBE", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._probe_values = os.getenv(
+            "SGLANG_DSPARK_EPILOGUE_PROBE_VALUES", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._probe_rank = int(os.getenv("SGLANG_DSPARK_EPILOGUE_PROBE_RANK", "0"))
+        self._probe_max_steps = max(
+            0, int(os.getenv("SGLANG_DSPARK_EPILOGUE_PROBE_MAX_STEPS", "8"))
+        )
+        self._probe_max_rows = max(
+            1, int(os.getenv("SGLANG_DSPARK_EPILOGUE_PROBE_MAX_ROWS", "4"))
+        )
+        self._probe_step = -1
+        self._probe_graph_runner = None
+        self._probe_capture_seen = set()
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self.verify_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int64, device=device
@@ -496,6 +538,123 @@ class DsparkVerifyEpilogue:
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
 
+    def _probe_active(self) -> bool:
+        return (
+            self._probe_enabled
+            and (self._probe_rank < 0 or self.tp_rank == self._probe_rank)
+            and self._probe_step < self._probe_max_steps
+        )
+
+    @staticmethod
+    def _probe_tensor_meta(tensor: Optional[torch.Tensor]) -> str:
+        if tensor is None:
+            return "None"
+        return (
+            f"shape={tuple(tensor.shape)},dtype={tensor.dtype},"
+            f"device={tensor.device},ptr=0x{tensor.data_ptr():x}"
+        )
+
+    @staticmethod
+    def _probe_tensor_values(tensor: torch.Tensor, rows: int):
+        if tensor.ndim <= 1:
+            return tensor[:rows].detach().cpu().tolist()
+        return tensor[:rows].detach().cpu().tolist()
+
+    def debug_capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
+        if not self._probe_enabled or (
+            self._probe_rank >= 0 and self.tp_rank != self._probe_rank
+        ):
+            return
+        try:
+            capturing = bool(
+                torch.get_device_module().is_current_stream_capturing()
+            )
+        except Exception:
+            capturing = None
+        key = (
+            id(runner),
+            int(forward_batch.batch_size),
+            int(num_tokens),
+            capturing,
+        )
+        if key in self._probe_capture_seen:
+            return
+        self._probe_capture_seen.add(key)
+        logger.warning(
+            "[DSPARK-EPILOGUE-PROBE] rank=%d stage=capture_hook "
+            "epilogue=0x%x graph_runner=0x%x backend=0x%x capturing=%s "
+            "bs=%s num_tokens=%s input_ids=(%s) logits=(%s) hidden=(%s)",
+            self.tp_rank,
+            id(self),
+            id(runner),
+            id(getattr(runner, "backend", None)),
+            capturing,
+            forward_batch.batch_size,
+            num_tokens,
+            self._probe_tensor_meta(getattr(forward_batch, "input_ids", None)),
+            self._probe_tensor_meta(getattr(out, "next_token_logits", None)),
+            self._probe_tensor_meta(getattr(out, "hidden_states", None)),
+        )
+
+    def debug_start_step(self, *, bs: int, graph_runner, extra: str = "") -> None:
+        self._probe_step += 1
+        self._probe_graph_runner = graph_runner
+        self.debug_snapshot(stage="before_replay", bs=bs, extra=extra)
+
+    def debug_snapshot(self, *, stage: str, bs: int, extra: str = "") -> None:
+        if not self._probe_active():
+            return
+        rows = min(int(bs), self._probe_max_rows)
+        graph_runner = self._probe_graph_runner
+        logger.warning(
+            "[DSPARK-EPILOGUE-PROBE] rank=%d step=%d stage=%s "
+            "epilogue=0x%x graph_runner=%s backend=%s bs=%d %s; "
+            "verify_lens=(%s); draft_tokens=(%s); correct_len=(%s); "
+            "bonus=(%s); commit_lens=(%s); out_tokens=(%s)",
+            self.tp_rank,
+            self._probe_step,
+            stage,
+            id(self),
+            "None" if graph_runner is None else f"0x{id(graph_runner):x}",
+            (
+                "None"
+                if graph_runner is None
+                else f"0x{id(getattr(graph_runner, 'backend', None)):x}"
+            ),
+            bs,
+            extra,
+            self._probe_tensor_meta(self.verify_lens_buf[:bs]),
+            self._probe_tensor_meta(self.draft_tokens_buf[: bs * self.gamma]),
+            self._probe_tensor_meta(self.correct_len_buf[:bs]),
+            self._probe_tensor_meta(self.bonus_buf[:bs]),
+            self._probe_tensor_meta(self.commit_lens_buf[:bs]),
+            self._probe_tensor_meta(self.out_tokens_buf[:bs]),
+        )
+        if not self._probe_values:
+            return
+        # Any device-to-host value dump synchronizes execution and can hide a
+        # cross-stream race. Keep it behind a separate, explicit switch.
+        torch.get_device_module().synchronize()
+        logger.warning(
+            "[DSPARK-EPILOGUE-PROBE-VALUES] rank=%d step=%d stage=%s "
+            "rows=%d verify_lens=%s draft_tokens=%s correct_len=%s bonus=%s "
+            "cap_trim_lens=%s commit_lens=%s new_seq_lens=%s out_tokens=%s",
+            self.tp_rank,
+            self._probe_step,
+            stage,
+            rows,
+            self._probe_tensor_values(self.verify_lens_buf, rows),
+            self._probe_tensor_values(
+                self.draft_tokens_buf.view(self.max_bs, self.gamma), rows
+            ),
+            self._probe_tensor_values(self.correct_len_buf, rows),
+            self._probe_tensor_values(self.bonus_buf, rows),
+            self._probe_tensor_values(self.cap_trim_lens_buf, rows),
+            self._probe_tensor_values(self.commit_lens_buf, rows),
+            self._probe_tensor_values(self.new_seq_lens_buf, rows),
+            self._probe_tensor_values(self.out_tokens_buf, rows),
+        )
+
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
             return
@@ -505,6 +664,7 @@ class DsparkVerifyEpilogue:
             or out.hidden_states is None
         ):
             return
+        self.debug_capture_hook(runner, out, forward_batch, num_tokens)
         self(
             compact_logits=out.next_token_logits,
             compact_hidden=out.hidden_states,
@@ -525,6 +685,7 @@ class DsparkVerifyEpilogue:
         self.inject_gate_buf.fill_(1 if armed else 0)
 
     def read_accept(self, bs: int) -> AcceptOuts:
+        self.debug_snapshot(stage="read_accept", bs=bs, extra="folded_accept=True")
         return AcceptOuts(
             correct_len=self.correct_len_buf[:bs],
             bonus=self.bonus_buf[:bs],
