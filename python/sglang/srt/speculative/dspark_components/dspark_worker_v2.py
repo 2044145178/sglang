@@ -49,6 +49,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+    ragged_capture_num_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -213,11 +214,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
         )
+        use_npu_dsv4_epilogue_hook = False
+        if _is_npu:
+            _, target_decode_attention_backend = (
+                server_args._resolved_attention_backends()
+            )
+            use_npu_dsv4_epilogue_hook = (
+                target_decode_attention_backend == "dsv4"
+            )
         self._verify_epilogue = None
         if (
             self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
-            and is_cuda()
+            and (is_cuda() or _is_npu)
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
@@ -232,8 +241,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 ),
             )
+            if use_npu_dsv4_epilogue_hook:
+                from sglang.srt.hardware_backend.npu.dsv4.dspark_graph_hooks import (
+                    make_dspark_verify_epilogue_capture_hook,
+                )
+
+                verify_epilogue_capture_hook = (
+                    make_dspark_verify_epilogue_capture_hook(self._verify_epilogue)
+                )
+            else:
+                verify_epilogue_capture_hook = self._verify_epilogue.capture_hook
             self.model_runner.capture_tail_hooks.append(
-                self._verify_epilogue.capture_hook
+                verify_epilogue_capture_hook
             )
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
@@ -347,11 +366,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                self._draft_sampler = (
-                    self._maybe_build_draft_sampler()
-                    if is_cuda()
-                    else None
-                )
+                self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
@@ -476,7 +491,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
-        if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
+        if (
+            batch.global_num_tokens is None
+            or not self._verify_planner.is_compact_mode
+            or ragged_capture_num_tokens(model_runner=self.model_runner) is None
+        ):
             return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
