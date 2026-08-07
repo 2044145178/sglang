@@ -214,6 +214,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
         )
+        use_npu_dsv4_epilogue_hook = False
+        if _is_npu:
+            _, target_decode_attention_backend = (
+                server_args._resolved_attention_backends()
+            )
+            use_npu_dsv4_epilogue_hook = (
+                target_decode_attention_backend == "dsv4"
+            )
         self._verify_epilogue = None
         if (
             self._verify_planner.is_compact_mode
@@ -233,7 +241,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 ),
             )
-            if _is_npu:
+            if use_npu_dsv4_epilogue_hook:
                 from sglang.srt.hardware_backend.npu.dsv4.dspark_graph_hooks import (
                     make_dspark_verify_epilogue_capture_hook,
                 )
@@ -358,11 +366,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                self._draft_sampler = (
-                    self._maybe_build_draft_sampler()
-                    if is_cuda() or _is_npu
-                    else None
-                )
+                self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
