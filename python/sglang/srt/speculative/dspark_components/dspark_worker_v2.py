@@ -232,10 +232,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
                 ),
-                tp_rank=self.ps.tp_rank,
             )
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.dsv4.dspark_graph_hooks import (
+                    make_dspark_verify_epilogue_capture_hook,
+                )
+
+                verify_epilogue_capture_hook = (
+                    make_dspark_verify_epilogue_capture_hook(self._verify_epilogue)
+                )
+            else:
+                verify_epilogue_capture_hook = self._verify_epilogue.capture_hook
             self.model_runner.capture_tail_hooks.append(
-                self._verify_epilogue.capture_hook
+                verify_epilogue_capture_hook
             )
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
@@ -686,17 +695,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        if epilogue is not None:
-            epilogue.debug_snapshot(
-                stage="fold_decision",
-                bs=bs,
-                extra=(
-                    f"proposal_folded={proposal.folded} "
-                    f"fold_eligible={fold_eligible} run_compact={run_compact} "
-                    f"can_run_cuda_graph={can_run_cuda_graph} "
-                    f"folded_accept={folded_accept}"
-                ),
-            )
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
             bs=bs,
