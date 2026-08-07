@@ -386,7 +386,11 @@ class TargetVerifyExecutor:
             model_runner=self.model_runner,
         )
         if self.verify_epilogue is not None:
-            self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
+            self.verify_epilogue.begin_step(
+                layout.verify_lens,
+                armed=inject_gate,
+                prefix_lens=batch.seq_lens,
+            )
             graph_runner = getattr(
                 self.model_runner, "decode_cuda_graph_runner", None
             )
@@ -516,6 +520,13 @@ class DsparkVerifyEpilogue:
         self.verify_lens_buf = torch.zeros(
             (self.max_bs,), dtype=torch.int64, device=device
         )
+        # TARGET_VERIFY's ForwardBatch.seq_lens is the attention/KV length
+        # after adding the speculative verify window.  Accept finalization,
+        # however, must add commit_lens to the live length from before verify.
+        # Keep that live prefix on a separate persistent graph input rail.
+        self.prefix_lens_buf = torch.zeros(
+            (self.max_bs,), dtype=torch.int64, device=device
+        )
         self.draft_tokens_buf = torch.zeros(
             (self.max_bs * self.gamma,), dtype=torch.int64, device=device
         )
@@ -609,7 +620,8 @@ class DsparkVerifyEpilogue:
         logger.warning(
             "[DSPARK-EPILOGUE-PROBE] rank=%d step=%d stage=%s "
             "epilogue=0x%x graph_runner=%s backend=%s bs=%d %s; "
-            "verify_lens=(%s); draft_tokens=(%s); correct_len=(%s); "
+            "verify_lens=(%s); prefix_lens=(%s); draft_tokens=(%s); "
+            "correct_len=(%s); "
             "bonus=(%s); commit_lens=(%s); out_tokens=(%s)",
             self.tp_rank,
             self._probe_step,
@@ -624,6 +636,7 @@ class DsparkVerifyEpilogue:
             bs,
             extra,
             self._probe_tensor_meta(self.verify_lens_buf[:bs]),
+            self._probe_tensor_meta(self.prefix_lens_buf[:bs]),
             self._probe_tensor_meta(self.draft_tokens_buf[: bs * self.gamma]),
             self._probe_tensor_meta(self.correct_len_buf[:bs]),
             self._probe_tensor_meta(self.bonus_buf[:bs]),
@@ -637,13 +650,15 @@ class DsparkVerifyEpilogue:
         torch.get_device_module().synchronize()
         logger.warning(
             "[DSPARK-EPILOGUE-PROBE-VALUES] rank=%d step=%d stage=%s "
-            "rows=%d verify_lens=%s draft_tokens=%s correct_len=%s bonus=%s "
-            "cap_trim_lens=%s commit_lens=%s new_seq_lens=%s out_tokens=%s",
+            "rows=%d verify_lens=%s prefix_lens=%s draft_tokens=%s "
+            "correct_len=%s bonus=%s cap_trim_lens=%s commit_lens=%s "
+            "new_seq_lens=%s out_tokens=%s",
             self.tp_rank,
             self._probe_step,
             stage,
             rows,
             self._probe_tensor_values(self.verify_lens_buf, rows),
+            self._probe_tensor_values(self.prefix_lens_buf, rows),
             self._probe_tensor_values(
                 self.draft_tokens_buf.view(self.max_bs, self.gamma), rows
             ),
@@ -669,12 +684,12 @@ class DsparkVerifyEpilogue:
             compact_logits=out.next_token_logits,
             compact_hidden=out.hidden_states,
             input_ids=forward_batch.input_ids,
-            seq_lens=forward_batch.seq_lens,
+            seq_lens=self.prefix_lens_buf,
             req_pool_indices=forward_batch.req_pool_indices,
             bs=forward_batch.batch_size,
         )
 
-    def begin_step(self, verify_lens, armed: bool) -> None:
+    def begin_step(self, verify_lens, armed: bool, prefix_lens=None) -> None:
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -682,6 +697,13 @@ class DsparkVerifyEpilogue:
             self.verify_lens_buf[:bs].copy_(verify_lens)
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
+        if prefix_lens is None:
+            self.prefix_lens_buf.zero_()
+        else:
+            bs = prefix_lens.shape[0]
+            self.prefix_lens_buf[:bs].copy_(prefix_lens)
+            if bs < self.max_bs:
+                self.prefix_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
 
     def read_accept(self, bs: int) -> AcceptOuts:
