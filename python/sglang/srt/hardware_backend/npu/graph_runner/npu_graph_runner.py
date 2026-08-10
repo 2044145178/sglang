@@ -28,15 +28,18 @@ import torch
 import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.hardware_backend.npu.multiplex.npu_pdmux_context import (
+    get_npu_pdmux_manager,
+)
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.multiplex.pdmux_context import (
+    get_current_stream_idx,
+)
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
     get_compiler_backend,
     is_npu,
-)
-from sglang.srt.multiplex.pdmux_context import (
-    get_current_stream_idx,
 )
 
 is_npu = is_npu()
@@ -132,9 +135,10 @@ class NPUGraphRunner(CudaGraphRunner):
         bs_key = self.bs
         if self.enable_pdmux:
             bs_key = f"{get_current_stream_idx()}_{self.bs}"
-        self.graphs[bs_key].update(
-            cpu_update_input=[{self.update_attr_name: seq_lens}]
-        )
+            self.graphs[bs_key].graph_dispatch_mode.update_stream = (
+                get_npu_pdmux_manager().current_update_stream
+            )
+        self.graphs[bs_key].update(cpu_update_input=[{self.update_attr_name: seq_lens}])
 
     def _cache_loc_dtype(self):
         return torch.int32

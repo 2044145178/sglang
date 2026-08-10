@@ -22,6 +22,7 @@ class _NPUMuxManagerImpl:
         self.npu_id = npu_id
         self.config = config
         self.stream_groups: List[Tuple[torch.npu.Stream, torch.npu.Stream]] = []
+        self.update_streams: List[torch.npu.Stream] = []
         self.cube_counts: List[Tuple[int, int]] = []  # (prefill_cubes, decode_cubes)
         self.current_idx: int = 0
 
@@ -87,17 +88,21 @@ class _NPUMuxManagerImpl:
         self.stream_groups.append(
             (torch.npu.Stream(device=self.npu_id), torch.npu.Stream(device=self.npu_id))
         )
+        self.update_streams.append(torch.npu.Stream(device=self.npu_id))
 
         for prefill_cubes, decode_cubes in divisions:
             self.cube_counts.append((prefill_cubes, decode_cubes))
             prefill_stream = self._create_limited_stream(prefill_cubes)
             decode_stream = self._create_limited_stream(decode_cubes)
+            update_stream = self._create_limited_stream(decode_cubes)
             self.stream_groups.append((prefill_stream, decode_stream))
+            self.update_streams.append(update_stream)
 
         self.cube_counts.append((0, total_cubes))
         self.stream_groups.append(
             (torch.npu.Stream(device=self.npu_id), torch.npu.Stream(device=self.npu_id))
         )
+        self.update_streams.append(torch.npu.Stream(device=self.npu_id))
 
         self.current_idx = 0
 
@@ -108,6 +113,10 @@ class _NPUMuxManagerImpl:
     @property
     def current_cube_counts(self) -> Tuple[int, int]:
         return self.cube_counts[self.current_idx]
+
+    @property
+    def current_update_stream(self) -> torch.npu.Stream:
+        return self.update_streams[self.current_idx]
 
     def set_current_stream_idx(self, idx: int):
         if idx < 0 or idx >= len(self.stream_groups):
