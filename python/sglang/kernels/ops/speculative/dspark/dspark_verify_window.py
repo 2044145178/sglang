@@ -883,8 +883,11 @@ def _build_out_tokens_kernel(
     bonus = tl.load(bonus_ptr + b, mask=mask, other=0)
     draft_mask = mask & (k < gamma)
     draft = tl.load(draft_tokens_ptr + b * gamma + k, mask=draft_mask, other=0)
-    val = tl.where(k == cl, bonus, tl.where(k < gamma, draft, 0))
-    tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
+    # Avoid nested tl.where on Ascend: its lowering can materialize the inner
+    # predicate as i8 while the select ABI requires i1.  First write the draft
+    # token (or zero), then overwrite the accepted boundary with the bonus.
+    tl.store(out_ptr + offs, draft.to(tl.int64), mask=mask)
+    tl.store(out_ptr + offs, bonus.to(tl.int64), mask=mask & (k == cl))
 
 
 def build_out_tokens_triton(
