@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 
@@ -50,6 +51,111 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_assert_get_last_loc_inputs(
+    *,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_pool_indices_cpu: Optional[torch.Tensor],
+    prefix_lens: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+) -> None:
+    """Synchronously validate every index consumed by get_last_loc.
+
+    This is deliberately opt-in because copying the live tensors to CPU adds a
+    device synchronization to every speculative allocation.  Besides catching
+    real row/column overflows, comparison with the scheduler's CPU mirrors
+    distinguishes bad bookkeeping from a plan-stream dependency race.
+    """
+    if os.getenv("SGLANG_DEBUG_ASSERT_GET_LAST_LOC", "0") != "1":
+        return
+
+    if req_to_token.device.type == "npu":
+        torch.npu.synchronize()
+
+    req_device_cpu = req_pool_indices.detach().to(
+        device="cpu", dtype=torch.int64
+    )
+    prefix_device_cpu = prefix_lens.detach().to(
+        device="cpu", dtype=torch.int64
+    )
+    prefix_host_cpu = prefix_lens_cpu.detach().to(
+        device="cpu", dtype=torch.int64
+    )
+    req_host_cpu = (
+        None
+        if req_pool_indices_cpu is None
+        else req_pool_indices_cpu.detach().to(device="cpu", dtype=torch.int64)
+    )
+
+    bs = int(prefix_device_cpu.numel())
+    context = (
+        f"table_shape={tuple(req_to_token.shape)}, "
+        f"table_stride={tuple(req_to_token.stride())}, "
+        f"table_dtype={req_to_token.dtype}, table_device={req_to_token.device}, "
+        f"table_ptr=0x{req_to_token.data_ptr():x}, bs={bs}"
+    )
+
+    if req_device_cpu.numel() != bs or prefix_host_cpu.numel() != bs:
+        raise RuntimeError(
+            "get_last_loc input length mismatch: "
+            f"req_device={req_device_cpu.numel()}, "
+            f"prefix_device={bs}, prefix_host={prefix_host_cpu.numel()}; "
+            f"{context}"
+        )
+    if req_host_cpu is not None and req_host_cpu.numel() != bs:
+        raise RuntimeError(
+            "get_last_loc req mirror length mismatch: "
+            f"req_device={req_device_cpu.numel()}, req_host={req_host_cpu.numel()}; "
+            f"{context}"
+        )
+
+    if not torch.equal(prefix_device_cpu, prefix_host_cpu):
+        raise RuntimeError(
+            "get_last_loc prefix_lens device/CPU mirror mismatch: "
+            f"device={prefix_device_cpu.tolist()}, host={prefix_host_cpu.tolist()}; "
+            f"{context}"
+        )
+    if req_host_cpu is not None and not torch.equal(req_device_cpu, req_host_cpu):
+        raise RuntimeError(
+            "get_last_loc req_pool_indices device/CPU mirror mismatch: "
+            f"device={req_device_cpu.tolist()}, host={req_host_cpu.tolist()}; "
+            f"{context}"
+        )
+
+    if req_to_token.ndim != 2:
+        raise RuntimeError(
+            f"get_last_loc expects a 2-D req_to_token table; {context}"
+        )
+    rows, cols = req_to_token.shape
+    valid_rows = (req_device_cpu >= 0) & (req_device_cpu < rows)
+    if not bool(valid_rows.all()):
+        bad = torch.nonzero(~valid_rows, as_tuple=False).flatten()
+        raise RuntimeError(
+            "get_last_loc req_pool_indices out of range: "
+            f"bad_positions={bad.tolist()}, values={req_device_cpu[bad].tolist()}, "
+            f"valid=[0,{rows}); {context}"
+        )
+
+    # prefix_len == 0 is valid and is masked to last_loc=-1.  Positive values
+    # address column prefix_len - 1, hence the inclusive upper bound `cols`.
+    valid_prefix = (prefix_device_cpu >= 0) & (prefix_device_cpu <= cols)
+    if not bool(valid_prefix.all()):
+        bad = torch.nonzero(~valid_prefix, as_tuple=False).flatten()
+        raise RuntimeError(
+            "get_last_loc prefix_lens out of range: "
+            f"bad_positions={bad.tolist()}, values={prefix_device_cpu[bad].tolist()}, "
+            f"valid=[0,{cols}]; {context}"
+        )
+
+    logger.warning(
+        "get_last_loc input assertion passed: %s, req_pool_indices=%s, "
+        "prefix_lens=%s",
+        context,
+        req_device_cpu.tolist(),
+        prefix_device_cpu.tolist(),
+    )
 
 
 def write_cache_indices(
@@ -688,6 +794,15 @@ def alloc_for_spec_decode(
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
         else:
+            _debug_assert_get_last_loc_inputs(
+                req_to_token=req_to_token_pool.req_to_token,
+                req_pool_indices=req_pool_indices,
+                req_pool_indices_cpu=(
+                    None if batch is None else batch.req_pool_indices_cpu
+                ),
+                prefix_lens=cur_kv_lens,
+                prefix_lens_cpu=cur_kv_lens_cpu,
+            )
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
