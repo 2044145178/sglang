@@ -66,6 +66,9 @@ class InsertParams:
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
 
+    # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
+    c128_value: Optional[torch.Tensor] = None
+
     # SWA specific
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
@@ -376,6 +379,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_swa(self) -> bool:
         return False
+
+    def swa_retain_floor(self, req) -> int | None:
+        # A match lands on a state checkpoint rather than on the tail, so a cache
+        # that pairs SWA with mamba/conv checkpoints has to keep the window behind
+        # the last checkpoint. Those caches override this. Everyone else has
+        # nothing deeper than the tail to protect.
+        return None
 
     def swa_reprefill_tail_tokens(self) -> int:
         # Only the unified_kv compress-only HiCache layout needs to hold back a
