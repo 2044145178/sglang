@@ -9,7 +9,9 @@ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_f
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import (
+    is_npu,
+)
 
 _is_npu = is_npu()
 

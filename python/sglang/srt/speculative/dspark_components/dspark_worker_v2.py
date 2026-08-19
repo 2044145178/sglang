@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -96,14 +97,14 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
-            server_args.enable_dp_attention and not self._draft_is_moe
+            get_parallel().enable_dp_attention and not self._draft_is_moe
         )
         self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
-            not server_args.disable_cuda_graph and not self._is_pd_prefill
+            not get_exec().graph.disable_cuda_graph and not self._is_pd_prefill
         )
         if (
-            server_args.enable_dp_attention
+            get_parallel().enable_dp_attention
             and self._draft_is_moe
             and ps.attn_tp_size > 1
         ):
@@ -129,7 +130,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
-        self._linear_accept_index_cache = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -203,7 +203,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
         )
         if (
-            server_args.enable_dp_attention
+            get_parallel().enable_dp_attention
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
@@ -229,7 +229,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
-            dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         use_npu_dsv4_epilogue_hook = False
         if _is_npu:
@@ -444,11 +444,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
-            )
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -750,6 +745,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        if batch.return_logprob:
+            compute_spec_logprobs(
+                batch,
+                logits_output,
+                accept.out_tokens.reshape(-1),
+                chain_stride=self.verify_num_draft_tokens,
+            )
+
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

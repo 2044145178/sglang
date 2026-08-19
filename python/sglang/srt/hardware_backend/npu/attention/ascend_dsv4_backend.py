@@ -16,11 +16,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.hardware_backend.npu.attention.ragged_verify_utils import (
     get_npu_bucketed_ragged_verify_layout,
 )
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -39,7 +38,7 @@ def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     cache = _walsh_hadamard_matrix._cache
     key = (n, str(device))
     cached = cache.get(key)
-    if cached is not None:
+    if cached is not None:Dsv4NpuRoPE
         return cached
     if not ((n & (n - 1) == 0) and (n > 0)):
         raise ValueError(f"n must be a positive power of 2, got {n}")
@@ -1058,11 +1057,25 @@ class DeepseekV4AscendAttnBackend(
         metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
         metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
 
+        n_tok = bs * tokens_per_req
         c4_pad = min(n_tok, n_tok // 4 + bs)
         c128_pad = min(n_tok, n_tok // 128 + bs)
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
         metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
+        metadata.dsv4_max_input_capacity = tokens_per_req
+        metadata.dsv4_explicit_state_block_tables = {
+            ratio: torch.full(
+                (
+                    bs,
+                    (2 if ratio == 4 else 1) * ratio + tokens_per_req,
+                ),
+                state_pool.dummy_state_loc,
+                dtype=torch.int32,
+                device=device,
+            )
+            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
+        }
         metadata.dsv4_max_input_capacity = tokens_per_req
         metadata.dsv4_explicit_state_block_tables = {
             ratio: torch.full(
@@ -2103,6 +2116,7 @@ class DeepseekV4AscendAttnBackend(
         dst: torch.Tensor,
         ratio: int,
         seq_lens_cpu: torch.Tensor,
+        n_draft: int,
         n_draft: int,
     ) -> None:
         dst.zero_()

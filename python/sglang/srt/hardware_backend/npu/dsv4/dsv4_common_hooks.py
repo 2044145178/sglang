@@ -235,11 +235,6 @@ def maybe_build_dsv4_verify_bundle(
         # device layout is allowed here; compact graph replay has its own
         # static metadata buffers and must not take this host path.
         verify_lens = [int(v) for v in ragged_layout.verify_lens.cpu().tolist()]
-    if len(verify_lens) != len(req_indices):
-        raise RuntimeError(
-            "DSV4 NPU verify bundle/layout batch mismatch: "
-            f"verify_lens={len(verify_lens)}, requests={len(req_indices)}."
-        )
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
         page_size = pool.c128_page_size

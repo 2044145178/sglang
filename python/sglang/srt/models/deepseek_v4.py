@@ -66,6 +66,8 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
+    attn_cp_overlap_all_gather_into_tensor,
+    attn_cp_overlap_reduce_scatter_tensor,
     attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_partial,
@@ -96,6 +98,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_finish,
+    cp_all_gather_rerange_launch,
     cp_all_gather_rerange_output,
     cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
@@ -139,6 +143,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
@@ -1181,6 +1186,15 @@ class MQALayer(MqaAttentionBase):
         x_quant=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
+        # kv_score depends only on x, so its CP all-gather can start before the
+        # projections and be collected inside forward_core_compressor below --
+        # the projections are what hides it. No-op unless the CP+TBO path armed
+        # _cp_prefetch_comm_stream.
+        if _is_hip and self.compressor is not None:
+            self.compressor.prelaunch_kv_score(x, forward_batch)
+            if self.indexer is not None:
+                self.indexer.compressor.prelaunch_kv_score(x, forward_batch)
+
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -1190,6 +1204,7 @@ class MQALayer(MqaAttentionBase):
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
+        kv_handle = None
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1312,11 +1327,22 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_materialize_global_token_order(
-                        kv.contiguous(),
-                        forward_batch,
-                        torch.cuda.current_stream(),
+                    comm_stream = getattr(
+                        forward_batch, "_cp_prefetch_comm_stream", None
                     )
+                    if comm_stream is not None:
+                        # kv is not read again until this function returns, so the
+                        # indexer + compressor below can run while it gathers.
+                        kv_handle = cp_all_gather_rerange_launch(
+                            kv, self.cp_size, comm_stream, ("kv", self.layer_id)
+                        )
+                        kv = None
+                    else:
+                        kv = cp_materialize_global_token_order(
+                            kv.contiguous(),
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -1353,6 +1379,9 @@ class MQALayer(MqaAttentionBase):
                 self.layer_id,
                 self.compressor,
             )
+
+        if _is_hip and kv_handle is not None:
+            kv = cp_all_gather_rerange_finish(kv_handle)
 
         return q, kv
 
@@ -1751,7 +1780,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
-        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+        if _is_hip:
             from aiter.ops.mhc import mhc_pre
 
             post, comb, y = mhc_pre(
@@ -1832,7 +1861,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             return mhc_post(x, residual, post, comb)
 
-        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+        elif _is_hip:
             from aiter.ops.mhc import mhc_post
 
             result = torch.empty_like(residual)
@@ -2008,7 +2037,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
-            and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -2350,6 +2378,67 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden = hidden + shared_local[:n]
         state.hidden_states_mlp_output = hidden
 
+    def _cp_tbo_launch(self, state, x, key, out_rows, collective):
+        assert _is_hip, "CP+TBO MoE overlap is HIP-only"
+        x = x.contiguous()
+        sub = state.tbo_subbatch_index
+        out = get_tbo_persistent_buffer(
+            (key, sub), out_rows, x.shape[1], x.dtype, x.device
+        )
+        comm = get_dp_tbo_comm_stream()
+        comm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(comm):
+            collective(out, x)
+            event = _tbo_event((key, sub))
+            event.record(comm)
+        return out, event, x
+
+    def op_cp_gather_a(self, state):
+        local = state.pop("hidden_states_mlp_input")
+        out, event, keepalive = self._cp_tbo_launch(
+            state,
+            local,
+            "cpgh",
+            local.shape[0] * get_parallel().attn_cp_size,
+            attn_cp_overlap_all_gather_into_tensor,
+        )
+        state.global_hidden = out
+        state.cp_gather_event = event
+        state.cp_gather_keepalive = keepalive
+
+    def op_cp_gather_b(self, state):
+        torch.cuda.current_stream().wait_event(state.pop("cp_gather_event"))
+        state.pop("cp_gather_keepalive")
+
+    def op_cp_moe(self, state):
+        fb = state.forward_batch
+        global_ids = fb._cp_moe_input_ids
+        with get_forward().scoped(mlp_reduce_scatter=True):
+            state.global_expert_out = self.mlp(
+                state.pop("global_hidden"),
+                fb,
+                input_ids=global_ids,
+                input_ids_global=global_ids,
+            )
+
+    def op_cp_combine_a(self, state):
+        global_out = state.pop("global_expert_out")
+        out, event, keepalive = self._cp_tbo_launch(
+            state,
+            global_out,
+            "cplo",
+            global_out.shape[0] // get_parallel().attn_cp_size,
+            attn_cp_overlap_reduce_scatter_tensor,
+        )
+        state.local_out = out
+        state.cp_combine_event = event
+        state.cp_combine_keepalive = keepalive
+
+    def op_cp_combine_b(self, state):
+        torch.cuda.current_stream().wait_event(state.pop("cp_combine_event"))
+        state.pop("cp_combine_keepalive")
+        state.hidden_states_mlp_output = state.pop("local_out")
+
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -2455,17 +2544,44 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
+    def _cp_children_splittable(self, forward_batch: ForwardBatch) -> bool:
+        children = forward_batch.tbo_children
+        if not children:
+            return False
+        cp_size = get_parallel().attn_cp_size
+        for child in children:
+            if child.batch_size <= 0 or child.extend_seq_lens_cpu is None:
+                return False
+            if sum(child.extend_seq_lens_cpu) < cp_size:
+                return False
+        return True
+
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
 
         TBO batch prep (tbo_split_seq_index / tbo_children) is populated
         model-agnostically when --enable-two-batch-overlap is set and the
         DP-attention preparer allows it (mori `normal` mode permits prefill
-        TBO). We additionally restrict to: prefill (EXTEND), single PP, and the
-        non-CP path, which is the only case the DSV4 op strategy implements.
+        TBO). We additionally restrict to: prefill (EXTEND), single PP, and a
+        path the DSV4 op strategy implements -- the non-CP path everywhere, plus
+        the round-robin DSA prefill CP path on HIP.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
+        if dsa_use_prefill_cp(forward_batch):
+            path_ok = (
+                _is_hip
+                and not is_cp_v2_active(forward_batch)
+                and is_dsa_prefill_cp_round_robin_split()
+                and get_moe_a2a_backend().is_none()
+                and self._cp_children_splittable(forward_batch)
+            )
+        else:
+            path_ok = (
+                not _is_hip
+                or not get_moe_a2a_backend().is_none()
+                or get_parallel().attn_dp_size > 1
+            )
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
@@ -2474,7 +2590,7 @@ class DeepseekV4Model(nn.Module):
             # MTP target-verify also reports is_extend(); only real prefill
             # should enter the prefill TBO strategy.
             and forward_batch.global_forward_mode.is_extend_without_speculative()
-            and not dsa_use_prefill_cp(forward_batch)
+            and path_ok
             and self.pp_group.world_size == 1
         )
 
@@ -2490,6 +2606,13 @@ class DeepseekV4Model(nn.Module):
             _model_forward_filter_inputs,
             _model_forward_tbo_merge_outputs,
         )
+
+        if _is_hip and dsa_use_prefill_cp(forward_batch):
+            return self._forward_layers_tbo_cp(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
         operations_strategy = OperationsStrategy.init_new_tbo(
@@ -2567,6 +2690,97 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    def _setup_child_cp_metadata(self, child: ForwardBatch, child_backend) -> None:
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
+        child.attn_cp_metadata = prepare_context_parallel_metadata(
+            len(child.input_ids),
+            cp_rank,
+            cp_size,
+            child.seq_lens_cpu.tolist(),
+            extend_seqs_len=child.extend_seq_lens_cpu,
+        )
+        if is_dsa_prefill_cp_round_robin_split():
+            metadata = child_backend.forward_metadata
+            core_meta = metadata.core_attn_metadata
+            core_meta.apply_cp_reindex()
+            core_meta.init_flashmla_related(is_prefill=True)
+            if metadata.indexer_metadata is not None:
+                metadata.indexer_metadata = child_backend.init_forward_metadata_indexer(
+                    core_meta
+                )
+
+    def _forward_layers_tbo_cp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        assert _is_hip, "CP+TBO prefill path is HIP-only"
+
+        from sglang.srt.batch_overlap.operations import execute_overlapped_operations
+        from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            _model_forward_filter_inputs,
+            _model_forward_tbo_merge_outputs,
+        )
+
+        original_len = hidden_states.shape[0]
+        cp_size = get_parallel().attn_cp_size
+        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+        operations_strategy = OperationsStrategy.init_new_tbo(
+            layers, forward_batch.global_forward_mode, use_cp=True
+        )
+
+        attn_backend = get_attn_backend()
+        children = forward_batch.tbo_children
+        # Attention-side CP gathers run two-phase (launch early on the comm
+        # stream / collect right before their consumer). Only the MoE
+        # collectives are splittable across a YieldOperation, so without this the
+        # ~2.5 attention-side collectives per layer would stay on the compute
+        # stream and defeat most of TBO's overlap.
+        prefetch_comm_stream = get_dp_tbo_comm_stream()
+
+        inputs_arr = []
+        for idx, child in enumerate(children):
+            child_inputs = _model_forward_filter_inputs(
+                hidden_states=hidden_states,
+                residual=None,
+                positions=positions,
+                output_forward_batch=child,
+                tbo_subbatch_index=idx,
+            )
+            self._setup_child_cp_metadata(child, attn_backend.children[idx])
+            if self.pp_group.is_first_rank:
+                child_inputs["hidden_states"] = cp_split_and_rebuild_data(
+                    child, child_inputs["hidden_states"]
+                )
+            child_inputs["positions"] = cp_split_and_rebuild_position(
+                child, child_inputs["positions"]
+            )
+            child._cp_moe_input_ids = cp_round_robin_input_ids(child.input_ids)
+            child._cp_prefetch_comm_stream = prefetch_comm_stream
+            inputs_arr.append(child_inputs)
+
+        outputs_arr = execute_overlapped_operations(
+            inputs_arr=inputs_arr,
+            operations_arr=[operations_strategy.operations] * 2,
+            delta_stages=[0, operations_strategy.tbo_delta_stages],
+        )
+
+        if self.pp_group.is_last_rank:
+            for idx, child in enumerate(children):
+                outputs_arr[idx]["hidden_states"] = cp_all_gather_rerange_output(
+                    outputs_arr[idx]["hidden_states"],
+                    cp_size,
+                    child,
+                    torch.cuda.current_stream(),
+                )
+        hidden_states, _ = _model_forward_tbo_merge_outputs(
+            outputs_arr[0], outputs_arr[1], original_len
+        )
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2608,7 +2822,13 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if use_prefill_cp:
+        capture_dspark = self.dspark_layers_to_capture is not None
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
+        # execution cannot expose per-layer completed hidden states), so skip
+        # TBO when capturing -- a perf-only downgrade, not a correctness one.
+        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        if use_prefill_cp and not run_tbo:
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
             else:
@@ -2624,12 +2844,7 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-        capture_dspark = self.dspark_layers_to_capture is not None
-        dspark_aux_hidden_states: List[torch.Tensor] = []
-        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
-        # execution cannot expose per-layer completed hidden states), so skip
-        # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        if self._can_run_tbo(forward_batch) and not capture_dspark:
+        if run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -2674,7 +2889,12 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and use_prefill_cp and not cp_v2_active:
+        if (
+            self.pp_group.is_last_rank
+            and use_prefill_cp
+            and not cp_v2_active
+            and not run_tbo
+        ):
             stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -2796,6 +3016,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         """V4 only fuses when explicitly asked to, and then the checkpoint must
         carry exactly one shared expert. Asked by the loader before any layer is
         built."""
+        # Need to disable if quant precision mismatch, even if
+        # --enforce-shared-experts-fusion is specified
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if not get_exec().moe.enforce_shared_experts_fusion:
             return "Config does not support fused shared expert(s)."
         if hf_config.n_shared_experts != 1:
@@ -2991,10 +3219,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not (
-            envs.SGLANG_DSV4_MHC_PREWARM.get()
-            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
-        ):
+        if _is_npu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
