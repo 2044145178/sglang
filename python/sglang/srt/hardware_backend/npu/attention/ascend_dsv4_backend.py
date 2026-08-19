@@ -1399,30 +1399,23 @@ class DeepseekV4AscendAttnBackend(
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
         if bundle is None:
             # Metadata storage is reused by every replay of this token tier.
-            # Never leave cache-write locations from the previous request.
+            # Never leave compressed-KV write locations from the previous
+            # request. Compressor state is fixed ring storage after the DSV4
+            # memory-pool refactor; its replay metadata is refreshed through
+            # dsv4_explicit_state_block_tables below, not through this
+            # allocation bundle.
             for ratio in self._dsv4_unique_compress_ratios:
                 if ratio not in (4, 128):
                     continue
                 self._copy_1d_with_zero_tail(
                     getattr(fm, f"c{ratio}_loc"), None
                 )
-                self._copy_1d_with_zero_tail(
-                    getattr(fm, f"c{ratio}_state_loc"), None
-                )
             return
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
             loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
-            state_loc = (
-                bundle.out_c4_state_loc
-                if ratio == 4
-                else bundle.out_c128_state_loc
-            )
             self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
-            self._copy_1d_with_zero_tail(
-                getattr(fm, f"c{ratio}_state_loc"), state_loc
-            )
 
     @staticmethod
     def _clear_graph_target_verify_metadata(ctx) -> None:
