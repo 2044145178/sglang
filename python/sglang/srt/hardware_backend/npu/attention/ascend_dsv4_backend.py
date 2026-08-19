@@ -16,6 +16,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.attention.ragged_verify_utils import (
+    get_npu_bucketed_ragged_verify_layout,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
@@ -117,7 +120,12 @@ class CompressorAscendBackendMixin:
         if padded_bs != layout.bs:
             spec_info = getattr(forward_batch, "spec_info", None)
             cap = int(getattr(spec_info, "draft_token_num", 1) or 1)
-            layout = layout.padded_to_bucket(padded_bs=padded_bs, cap=cap)
+            layout = get_npu_bucketed_ragged_verify_layout(
+                spec_info=spec_info,
+                layout=layout,
+                padded_bs=padded_bs,
+                cap=cap,
+            )
         return layout
 
     @staticmethod
@@ -1149,8 +1157,11 @@ class DeepseekV4AscendAttnBackend(
             # Recreate the same geometry here, then copy it into the stable
             # captured Q-indptr buffer below.
             if ragged_layout.bs != bs or ragged_layout.cap is None:
-                ragged_layout = ragged_layout.padded_to_bucket(
-                    padded_bs=bs, cap=tokens_per_bs
+                ragged_layout = get_npu_bucketed_ragged_verify_layout(
+                    spec_info=forward_batch.spec_info,
+                    layout=ragged_layout,
+                    padded_bs=bs,
+                    cap=tokens_per_bs,
                 )
             verify_lens = ragged_layout.verify_lens.to(device=device, dtype=torch.int32)
             # Correctness-first host mirror for compressor position planning.

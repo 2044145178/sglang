@@ -19,6 +19,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention.ragged_verify_utils import (
+    get_npu_bucketed_ragged_verify_layout,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -773,7 +776,9 @@ class AscendAttnBackend(AttentionBackend):
             ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
             if ragged_layout is not None:
                 if ragged_layout.bs != bs:
-                    ragged_layout = ragged_layout.padded_to_bucket(
+                    ragged_layout = get_npu_bucketed_ragged_verify_layout(
+                        spec_info=spec_info,
+                        layout=ragged_layout,
                         padded_bs=bs,
                         cap=int(
                             getattr(
