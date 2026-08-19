@@ -2037,6 +2037,55 @@ class DeepseekV4AscendAttnBackend(
                         loc[: bl.numel()].copy_(bl.to(torch.int32))
                 setattr(fm, f"c{ratio}_loc", loc)
 
+    def _fill_ragged_verify_positions_cmp_padding_one(
+        self,
+        *,
+        positions: torch.Tensor,
+        dst: torch.Tensor,
+        ratio: int,
+        final_seq_lens_cpu: torch.Tensor,
+        verify_lens_cpu: torch.Tensor,
+    ) -> None:
+        """Select packed verify rows that complete a compressed block.
+
+        Compact verify stores a variable number of consecutive rows for each
+        request, so the uniform ``request_id * n_draft`` mapping cannot be
+        used. Build flattened row indices from each request's verify length
+        and gather the corresponding position values into the fixed graph
+        metadata buffer.
+        """
+        dst.zero_()
+        if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
+            return
+
+        indices: list[torch.Tensor] = []
+        row_offset = 0
+        for final_len, verify_len in zip(
+            final_seq_lens_cpu.tolist(), verify_lens_cpu.tolist()
+        ):
+            verify_len = int(verify_len)
+            if verify_len <= 0:
+                continue
+
+            # Position zero completes sequence length one. Convert the final
+            # sequence length back to the sequence-number range represented by
+            # this request's packed verify rows.
+            first_seq_number = int(final_len) - verify_len + 1
+            seq_numbers = torch.arange(
+                first_seq_number,
+                first_seq_number + verify_len,
+                dtype=torch.int64,
+            )
+            local = torch.nonzero(seq_numbers % ratio == 0, as_tuple=False).flatten()
+            if local.numel() > 0:
+                indices.append(local + row_offset)
+            row_offset += verify_len
+
+        if not indices:
+            return
+        gather = torch.cat(indices)[: dst.numel()].to(device=positions.device)
+        dst[: gather.numel()].copy_(torch.gather(positions, 0, gather))
+
     def _fill_verify_positions_cmp_padding_one(
         self,
         positions: torch.Tensor,
