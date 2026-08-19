@@ -664,7 +664,7 @@ def build_unified_commit_inject_layout(
 class BuildCommitInjectLayout:
     @classmethod
     def execute(cls, *args, **kwargs) -> CommitInjectLayoutResult:
-        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
+        if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
