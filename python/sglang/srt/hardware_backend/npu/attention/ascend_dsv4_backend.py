@@ -160,9 +160,7 @@ class CompressorAscendBackendMixin:
         if _verify_compress:
             n_draft = int(forward_batch.spec_info.draft_token_num)
             _seq_lens = _seq_lens + (
-                ragged_layout.verify_lens
-                if ragged_layout is not None
-                else n_draft
+                ragged_layout.verify_lens if ragged_layout is not None else n_draft
             )
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
@@ -1052,7 +1050,6 @@ class DeepseekV4AscendAttnBackend(
         metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
         metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
 
-        n_tok = bs * tokens_per_req
         c4_pad = min(n_tok, n_tok // 4 + bs)
         c128_pad = min(n_tok, n_tok // 128 + bs)
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
@@ -1155,9 +1152,7 @@ class DeepseekV4AscendAttnBackend(
                 ragged_layout = ragged_layout.padded_to_bucket(
                     padded_bs=bs, cap=tokens_per_bs
                 )
-            verify_lens = ragged_layout.verify_lens.to(
-                device=device, dtype=torch.int32
-            )
+            verify_lens = ragged_layout.verify_lens.to(device=device, dtype=torch.int32)
             # Correctness-first host mirror for compressor position planning.
             # The graph-owned Q indptr remains device-side and is refreshed
             # without reallocating. This mirror can later be replaced by an
@@ -1197,9 +1192,7 @@ class DeepseekV4AscendAttnBackend(
                 # compressor state for them.
                 effective_verify_lens_cpu = verify_lens_cpu.clone()
                 effective_verify_lens_cpu[raw_bs:].zero_()
-                final_seq_lens_cpu = (
-                    live_seq_lens_cpu + effective_verify_lens_cpu
-                )
+                final_seq_lens_cpu = live_seq_lens_cpu + effective_verify_lens_cpu
             elif self._is_dspark_algorithm or explicit_live_cpu is not None:
                 # DSpark/DFLASH temporarily expand seq_lens_cpu to the final
                 # target-verify length and carry the committed/live prefix
@@ -1392,9 +1385,7 @@ class DeepseekV4AscendAttnBackend(
             )
         else:
             fm.seqused.copy_(
-                (valid.to(torch.int32) * int(ctx.tokens_per_bs)).to(
-                    device=ctx.device
-                )
+                (valid.to(torch.int32) * int(ctx.tokens_per_bs)).to(device=ctx.device)
             )
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
         if bundle is None:
@@ -1407,9 +1398,7 @@ class DeepseekV4AscendAttnBackend(
             for ratio in self._dsv4_unique_compress_ratios:
                 if ratio not in (4, 128):
                     continue
-                self._copy_1d_with_zero_tail(
-                    getattr(fm, f"c{ratio}_loc"), None
-                )
+                self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), None)
             return
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
@@ -1606,8 +1595,7 @@ class DeepseekV4AscendAttnBackend(
                 0, B + 1, dtype=torch.int32, device=device
             )
         elif (
-            forward_batch.forward_mode.is_target_verify()
-            and ragged_layout is not None
+            forward_batch.forward_mode.is_target_verify() and ragged_layout is not None
         ):
             fm.actual_seq_lengths_q_pa = ragged_layout.qo_indptr_device.to(
                 device=device, dtype=torch.int32
@@ -2048,6 +2036,7 @@ class DeepseekV4AscendAttnBackend(
                         )
                         loc[: bl.numel()].copy_(bl.to(torch.int32))
                 setattr(fm, f"c{ratio}_loc", loc)
+
     def _fill_verify_positions_cmp_padding_one(
         self,
         positions: torch.Tensor,
