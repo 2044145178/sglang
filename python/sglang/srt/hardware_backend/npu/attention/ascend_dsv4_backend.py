@@ -38,7 +38,7 @@ def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     cache = _walsh_hadamard_matrix._cache
     key = (n, str(device))
     cached = cache.get(key)
-    if cached is not None:Dsv4NpuRoPE
+    if cached is not None:
         return cached
     if not ((n & (n - 1) == 0) and (n > 0)):
         raise ValueError(f"n must be a positive power of 2, got {n}")
@@ -2116,7 +2116,6 @@ class DeepseekV4AscendAttnBackend(
         dst: torch.Tensor,
         ratio: int,
         seq_lens_cpu: torch.Tensor,
-        n_draft: int,
         n_draft: int,
     ) -> None:
         dst.zero_()
