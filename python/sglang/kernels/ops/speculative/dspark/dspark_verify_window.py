@@ -23,7 +23,7 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
 class BuildRaggedVerifyWindow:
     @classmethod
     def execute(cls, *args, **kwargs) -> RaggedVerifyWindow:
-        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
+        if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
